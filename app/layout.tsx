@@ -12,13 +12,15 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH || "";
+
 export const metadata: Metadata = {
   title: "AI Key Vault",
   description: "本地管理 AI API Key 配置",
   icons: {
-    icon: "/logo.png",
-    shortcut: "/logo.png",
-    apple: "/logo.png"
+    icon: `${basePath}/logo.png`,
+    shortcut: `${basePath}/logo.png`,
+    apple: `${basePath}/logo.png`
   }
 };
 

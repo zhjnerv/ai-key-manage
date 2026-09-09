@@ -22,17 +22,29 @@
 - 支持一次粘贴多个配置，解析后可批量直接新增
 - 支持把解析结果先回填到表单，再决定要不要保存
 
-### ✅ 可用性测试
+### ✅ 多协议可用性测试
 
 - 支持单条测试，也支持一键测试全部配置
-- 测试结果会记录状态、错误详情、最近测试时间
-- 适合先快速判断某个 Key 和地址现在还能不能打通
+- 自动探测 OpenAI Chat Completions（流式/普通）、OpenAI Responses 和 Claude Messages
+- 成功结果会明确显示实际命中的 `chat`、`response` 或 `message` 协议
+- Claude 模型优先使用官方 Messages 请求格式测试
+- 测试结果会记录状态、错误详情、协议、回复内容和最近测试时间
 
 ### 🧠 模型识别
 
-- 支持读取当前 Key 在该渠道下能看到的模型列表
+- 支持使用 Bearer 和 Claude `x-api-key` 两种鉴权方式读取模型列表
 - 识别完成后会给出推荐模型，并支持复制模型列表
+- 自动从模型名称识别 GPT Image、DALL·E、Flux、Stable Diffusion、Imagen、Ideogram、Recraft、Seedream、CogView、Qwen Image 等主流图像生成模型
 - 支持在识别结果里直接切换当前模型
+
+
+### 🖼️ 图像模型测试
+
+- 使用 OpenAI 兼容的 `POST /v1/images/generations` 接口进行真实生图测试
+- 可以从自动识别的图像模型中选择，也可以手工填写模型名称
+- 同时兼容返回 Base64 图片和临时图片 URL 的渠道
+- 测试成功后展示生成图片、协议、耗时和修订后的提示词
+- 生图会产生真实模型费用，必须由用户主动点击触发
 
 ### ⚡ 性能评测
 
@@ -57,15 +69,15 @@
 
 ## 隐私和数据说明
 
-这个项目默认把配置数据保存在浏览器本地的 `localStorage` 里，不接数据库，也不会帮你托管 Key。
+这个项目是纯静态前端，配置和测试结果默认保存在浏览器本地的 `localStorage`，不接数据库，也没有项目自建后端。
 
-但有一点要说明白: 连通性测试、模型识别、性能评测这类真实联网请求，还是会经过项目自己的同源后端接口转发。这样做主要是为了绕开浏览器直连上游时常见的 CORS 问题。
+所有测试请求都由浏览器直接发送到你填写的 API 地址：
 
-简单理解就是:
-
-- 配置数据默认存在你自己的浏览器里
-- 项目没有做数据库存储逻辑
-- 真正发请求测试时，Key 会参与当前这次后端转发请求
+- Key 不会提交给本项目的服务器；
+- Key 会作为鉴权信息发送到你填写的目标 API；
+- 目标 API 必须允许浏览器跨域访问（CORS）；
+- Claude 官方 Messages API 会携带 `anthropic-dangerous-direct-browser-access: true`；
+- 页面脚本或浏览器扩展如果被恶意控制，仍可能读取 `localStorage` 中的 Key，不要在不可信环境中使用。
 
 ## 快速开始
 
@@ -76,14 +88,20 @@ npm run dev
 
 打开 [http://localhost:3000](http://localhost:3000) 就能开始用。
 
-## 打包部署
+## 打包与本地预览
 
 ```bash
 npm run build
 npm run start
 ```
 
-部署到支持 Next.js 的平台也没问题，比如 Vercel、Netlify 等。
+`npm run build` 会生成纯静态 `out/` 目录，`npm run start` 使用项目内置的零依赖静态服务器预览。
+
+## GitHub Pages 部署
+
+仓库内置 `.github/workflows/deploy-pages.yml`。推送到 `main` 后，GitHub Actions 会依次执行测试、ESLint、静态构建并部署到 GitHub Pages。
+
+首次部署需要在仓库 **Settings → Pages → Build and deployment** 中选择 **GitHub Actions**。
 
 ## Docker 一键部署
 
@@ -112,9 +130,10 @@ docker compose up -d --build
 
 1. 填一条配置，或者直接把现成的 `curl` / JSON / 文本块粘进来
 2. 点“保存配置”或者“粘贴并直接新增”
-3. 先做连通性测试，确认地址和 Key 没问题
-4. 再做模型识别，看看这个渠道到底开放了哪些模型
-5. 如果模型很多，就打开性能评测，跑几轮后挑一个更适合日常使用的默认模型
+3. 先做连通性测试，确认地址、Key、模型以及实际命中的协议
+4. 再做模型识别，查看文本模型和自动识别出的图像模型
+5. 图像模型使用“图像测试”生成测试图；文本模型可以进入性能评测
+6. 如果文本模型很多，跑几轮后挑一个更适合日常使用的默认模型
 
 ## 技术栈
 
