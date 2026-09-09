@@ -14,6 +14,7 @@ import {
   FaExchangeAlt,
   FaFileExport,
   FaGithub,
+  FaImage,
   FaInfoCircle,
   FaKey,
   FaLink,
@@ -28,11 +29,22 @@ import {
   FaVial
 } from "react-icons/fa";
 import { parseCcSwitchSqlProviders } from "@/lib/cc-switch-sql";
+import {
+  isLikelyImageGenerationModel,
+  makeErrorDetail,
+  runEndpointTest,
+  runImageGenerationTest,
+  runModelBenchmarkRound,
+  runModelProbe as probeEndpointModels
+} from "@/lib/ai-endpoint-client";
 import type {
-  OpenAIProxyBenchmarkRoundResponse,
-  OpenAIProxyProbeResponse,
-  OpenAIProxyTestResponse
-} from "@/lib/openai-proxy-types";
+  BenchmarkRoundResponse,
+  EndpointTestResponse,
+  ImageGenerationTestResponse,
+  ModelProbeResponse,
+  ResponseTransport,
+  TextProtocol
+} from "@/lib/ai-endpoint-types";
 
 type KeyConfig = {
   id: string;
@@ -48,6 +60,7 @@ type KeyConfig = {
   probe?: {
     status: "success" | "error";
     supportedModels: string[];
+    imageModels: string[];
     recommendedModel?: string;
     detail?: string;
     testedAt: string;
@@ -57,7 +70,8 @@ type KeyConfig = {
     message: string;
     detail?: string;
     responseText?: string;
-    responseSource?: "stream" | "chat" | "responses";
+    protocol?: TextProtocol;
+    transport?: ResponseTransport;
     testedAt: string;
   };
   benchmarks?: Record<string, FinishedModelBenchmarkResult>;
@@ -79,23 +93,27 @@ type TestResult = {
   message: string;
   detail?: string;
   responseText?: string;
-  responseSource?: "stream" | "chat" | "responses";
+  protocol?: TextProtocol;
+  transport?: ResponseTransport;
   testedAt?: string;
 };
 type FinishedTestResult = NonNullable<KeyConfig["lastTest"]>;
 type ProbeResult = {
   status: TestStatus;
   supportedModels: string[];
+  imageModels: string[];
   recommendedModel?: string;
   detail?: string;
   testedAt?: string;
 };
 type FinishedProbeResult = NonNullable<KeyConfig["probe"]>;
+type ImageTestResult = ImageGenerationTestResponse["result"];
 type BenchmarkRoundDetail = {
   round: number;
   ok: boolean;
   elapsedMs?: number;
   firstTokenMs?: number;
+  protocol?: TextProtocol;
   error?: string;
 };
 type ModelBenchmarkResult = {
@@ -158,7 +176,8 @@ type CcSwitchAction = {
 const STORAGE_KEY = "ai-key-vault-configs-v1";
 const LEGACY_STORAGE_KEYS = ["ai-key-vault-configs", "ai-key-check-configs-v1"];
 const INTRO_SEEN_KEY = "ai-key-vault-intro-seen-v1";
-const SOURCE_REPO_URL = "https://github.com/Yoan98/ai-key-manage";
+const SOURCE_REPO_URL = "https://github.com/zhjnerv/ai-key-manage";
+const APP_BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
 const PASS_TEXT = "主人，快鞭策我吧";
 const FAIL_TEXT = "主人，我不行了";
 const DEFAULT_BENCHMARK_ROUNDS = 2;
@@ -197,7 +216,7 @@ const smallDangerBtn =
   "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:border-red-700 hover:bg-red-700 hover:text-white";
 const iconCopyBtn =
   "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45";
-const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses；测试会兼容流式、普通响应和 Responses，并优先展示信息量更高的那份回复。";
+const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses、/messages；测试会自动探测 chat、response、message 协议。GitHub Pages 版本由浏览器直连，目标地址必须允许 CORS。";
 const ReactECharts = dynamic(() => import("echarts-for-react"), { ssr: false });
 
 function normalizeBaseUrl(raw: string): string {
@@ -806,6 +825,10 @@ function normalizeBenchmarkRoundDetail(input: unknown, index = 0): BenchmarkRoun
     typeof input.firstTokenMs === "number" && Number.isFinite(input.firstTokenMs)
       ? Math.max(0, Math.round(input.firstTokenMs))
       : undefined;
+  const protocol =
+    input.protocol === "chat" || input.protocol === "response" || input.protocol === "message"
+      ? input.protocol
+      : undefined;
   const error = typeof input.error === "string" && input.error.trim() ? cleanOneLineText(input.error, 260) : undefined;
 
   return {
@@ -813,6 +836,7 @@ function normalizeBenchmarkRoundDetail(input: unknown, index = 0): BenchmarkRoun
     ok,
     elapsedMs,
     firstTokenMs,
+    protocol,
     error
   };
 }
@@ -869,10 +893,26 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
   const responseTextSource =
     typeof input.responseText === "string" && input.responseText.trim() ? input.responseText : legacyResponseText;
   const responseText = responseTextSource ? cleanMultilineText(responseTextSource, 2000) : "";
-  const responseSource =
+  const legacySource =
     input.responseSource === "stream" || input.responseSource === "chat" || input.responseSource === "responses"
       ? input.responseSource
       : undefined;
+  const protocol =
+    input.protocol === "chat" || input.protocol === "response" || input.protocol === "message"
+      ? input.protocol
+      : legacySource === "responses"
+        ? "response"
+        : legacySource
+          ? "chat"
+          : undefined;
+  const transport =
+    input.transport === "stream" || input.transport === "json"
+      ? input.transport
+      : legacySource === "stream"
+        ? "stream"
+        : legacySource
+          ? "json"
+          : undefined;
   const detail = rawDetail && !legacyResponseText ? cleanOneLineText(rawDetail, 300) : responseText ? "接口连通，已收到模型回复" : "";
   const testedAt = safeDateToIso(input.testedAt);
 
@@ -883,7 +923,8 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
     message: message || (status === "success" ? PASS_TEXT : FAIL_TEXT),
     detail: detail || undefined,
     responseText: responseText || undefined,
-    responseSource,
+    protocol,
+    transport,
     testedAt
   };
 }
@@ -897,6 +938,9 @@ function normalizeFinishedProbeResult(input: unknown): FinishedProbeResult | und
   const supportedModels = Array.isArray(input.supportedModels)
     ? input.supportedModels.map((item) => String(item).trim()).filter(Boolean)
     : [];
+  const imageModels = Array.isArray(input.imageModels)
+    ? uniqueStrings(input.imageModels.map((item) => String(item)))
+    : supportedModels.filter(isLikelyImageGenerationModel);
   const recommendedModel = typeof input.recommendedModel === "string" ? input.recommendedModel.trim() : "";
   const detail = typeof input.detail === "string" && input.detail.trim() ? cleanOneLineText(input.detail, 300) : "";
   const testedAt = safeDateToIso(input.testedAt);
@@ -906,6 +950,7 @@ function normalizeFinishedProbeResult(input: unknown): FinishedProbeResult | und
   return {
     status,
     supportedModels,
+    imageModels,
     recommendedModel: recommendedModel || undefined,
     detail: detail || undefined,
     testedAt
@@ -976,7 +1021,7 @@ function inferModelTags(model: string): string[] {
   const normalized = model.trim();
   if (!normalized) return [];
 
-  const out: string[] = [];
+  const out: string[] = isLikelyImageGenerationModel(normalized) ? ["image"] : [];
   for (const rule of MODEL_TAG_RULES) {
     if (rule.patterns.some((pattern) => pattern.test(normalized))) {
       out.push(rule.tag);
@@ -1217,7 +1262,7 @@ function toDateTimeLabel(iso: string): string {
 }
 
 function defaultProbeResult(): ProbeResult {
-  return { status: "idle", supportedModels: [] };
+  return { status: "idle", supportedModels: [], imageModels: [] };
 }
 
 function getSourceBadge(meta?: KeyConfig["sourceMeta"]): string {
@@ -1225,47 +1270,6 @@ function getSourceBadge(meta?: KeyConfig["sourceMeta"]): string {
   if (meta.kind === "cc-switch-deeplink") return "CC Switch 链接";
   if (meta.kind === "cc-switch-provider") return "CC Switch 配置";
   return "手动";
-}
-
-async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<unknown> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
-    let payload: unknown = null;
-
-    try {
-      payload = await response.json();
-    } catch {
-      payload = null;
-    }
-
-    if (!response.ok) {
-      throw {
-        status: response.status,
-        message: getErrorMessage(payload) || `HTTP ${response.status}`
-      };
-    }
-
-    return payload;
-  } finally {
-    window.clearTimeout(timer);
-  }
-}
-
-async function postJsonWithTimeout<TResponse>(url: string, body: unknown, timeoutMs: number): Promise<TResponse> {
-  return (await fetchJsonWithTimeout(
-    url,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    },
-    timeoutMs
-  )) as TResponse;
 }
 
 function inferCcSwitchHomepage(endpoint: string): string {
@@ -1300,59 +1304,6 @@ function buildCcSwitchDeepLink(item: KeyConfig, app: CcSwitchApp): string {
 
   params.set("enabled", "false");
   return `ccswitch://v1/import?${params.toString()}`;
-}
-
-function getErrorMessage(error: unknown): string {
-  if (!isRecord(error)) return "";
-
-  const directError = error.error;
-  if (typeof directError === "string" && directError.trim()) return cleanOneLineText(directError, 260);
-
-  const directMessage = error.message;
-  if (typeof directMessage === "string" && directMessage.trim()) return cleanOneLineText(directMessage, 260);
-
-  const nestedPaths = [
-    ["error", "message"],
-    ["response", "error", "message"],
-    ["response", "data", "error", "message"],
-    ["response", "body", "error", "message"],
-    ["data", "error", "message"],
-    ["body", "error", "message"],
-    ["cause", "message"]
-  ];
-
-  for (const path of nestedPaths) {
-    let current: unknown = error;
-    for (const key of path) {
-      if (!isRecord(current)) {
-        current = "";
-        break;
-      }
-      current = current[key];
-    }
-    if (typeof current === "string" && current.trim()) return cleanOneLineText(current, 260);
-  }
-
-  return "";
-}
-
-function makeErrorDetail(error: unknown): string {
-  const baseError = isRecord(error) ? error : {};
-  const status = typeof baseError.status === "number" ? baseError.status : undefined;
-  const name = typeof baseError.name === "string" ? baseError.name : "";
-  const raw = getErrorMessage(error);
-
-  let detail = "测试异常，请检查地址或模型";
-  if (status === 401 || status === 403) detail = "Key 无效或权限不足";
-  else if (status === 404) detail = "地址可达，但聊天接口不存在";
-  else if (typeof status === "number") detail = `请求失败（HTTP ${status}）`;
-  else if (name === "AbortError" || /timeout|timed out/i.test(raw)) detail = "请求超时，请检查地址";
-  else if (/network|fetch failed|connection|ENOTFOUND|ECONNREFUSED/i.test(raw))
-    detail = "请求失败，请检查网络或地址";
-
-  if (!raw) return detail;
-  if (detail.includes(raw)) return detail;
-  return `${detail}；接口返回：${raw}`;
 }
 
 function normalizeStoredConfigItem(input: unknown, index: number): KeyConfig | undefined {
@@ -1428,10 +1379,10 @@ function defaultTestResult(): TestResult {
   return { status: "idle", message: "未测试" };
 }
 
-function testResponseSourceLabel(source?: TestResult["responseSource"]): string {
-  if (source === "stream") return "流式";
-  if (source === "responses") return "Responses";
-  if (source === "chat") return "普通";
+function testProtocolLabel(protocol?: TextProtocol, transport?: ResponseTransport): string {
+  if (protocol === "chat") return transport === "stream" ? "chat · stream" : "chat";
+  if (protocol === "response") return "response";
+  if (protocol === "message") return "message";
   return "";
 }
 
@@ -1476,6 +1427,8 @@ export default function Home() {
   const [loadingMap, setLoadingMap] = useState<Record<string, boolean>>({});
   const [resultMap, setResultMap] = useState<Record<string, TestResult>>({});
   const [probeMap, setProbeMap] = useState<Record<string, ProbeResult>>({});
+  const [imageTestMap, setImageTestMap] = useState<Record<string, ImageTestResult>>({});
+  const [imageLoadingMap, setImageLoadingMap] = useState<Record<string, boolean>>({});
   const [benchmarkMap, setBenchmarkMap] = useState<Record<string, Record<string, ModelBenchmarkResult>>>({});
   const [notice, setNotice] = useState("");
   const [testingAll, setTestingAll] = useState(false);
@@ -1487,6 +1440,8 @@ export default function Home() {
   const [ccSwitchDialogId, setCcSwitchDialogId] = useState<string | null>(null);
   const [ccSwitchTargetApp, setCcSwitchTargetApp] = useState<CcSwitchApp>("codex");
   const [probeDialogId, setProbeDialogId] = useState<string | null>(null);
+  const [imageDialogId, setImageDialogId] = useState<string | null>(null);
+  const [imageModelDraft, setImageModelDraft] = useState("");
   const [benchmarkDialogId, setBenchmarkDialogId] = useState<string | null>(null);
   const [benchmarkSearch, setBenchmarkSearch] = useState("");
   const [benchmarkRoundsInput, setBenchmarkRoundsInput] = useState(String(DEFAULT_BENCHMARK_ROUNDS));
@@ -1532,6 +1487,8 @@ export default function Home() {
     [configs, ccSwitchDialogId]
   );
   const probeDialogItem = useMemo(() => configs.find((item) => item.id === probeDialogId) || null, [configs, probeDialogId]);
+  const imageDialogItem = useMemo(() => configs.find((item) => item.id === imageDialogId) || null, [configs, imageDialogId]);
+  const activeImageTest = imageDialogItem ? imageTestMap[imageDialogItem.id] : undefined;
   const benchmarkDialogItem = useMemo(
     () => configs.find((item) => item.id === benchmarkDialogId) || null,
     [benchmarkDialogId, configs]
@@ -2112,6 +2069,16 @@ export default function Home() {
       delete next[id];
       return next;
     });
+    setImageTestMap((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setImageLoadingMap((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
     if (editingModelId === id) {
       setEditingModelId(null);
       setModelDraft("");
@@ -2121,6 +2088,9 @@ export default function Home() {
     }
     if (probeDialogId === id) {
       setProbeDialogId(null);
+    }
+    if (imageDialogId === id) {
+      setImageDialogId(null);
     }
     if (benchmarkDialogId === id) {
       setBenchmarkDialogId(null);
@@ -2140,6 +2110,8 @@ export default function Home() {
     setConfigs([]);
     setResultMap({});
     setProbeMap({});
+    setImageTestMap({});
+    setImageLoadingMap({});
     setBenchmarkMap({});
     setLoadingMap({});
     setEditingId(null);
@@ -2148,6 +2120,8 @@ export default function Home() {
     setFormSourceMeta(undefined);
     setCcSwitchDialogId(null);
     setProbeDialogId(null);
+    setImageDialogId(null);
+    setImageModelDraft("");
     setBenchmarkDialogId(null);
     setNotice("已删除全部配置");
   }
@@ -2239,31 +2213,12 @@ export default function Home() {
     setLoadingMap((prev) => ({ ...prev, [item.id]: true }));
     setResultMap((prev) => ({ ...prev, [item.id]: { status: "pending", message: "测试中..." } }));
 
-    const baseUrl = toOpenAIBaseUrl(item.baseUrl);
-    const apiKey = cleanKey(item.apiKey);
-
-    if (!baseUrl || !apiKey) {
-      commitFinishedTestResult(item.id, {
-        status: "error",
-        message: FAIL_TEXT,
-        detail: "地址或 Key 为空",
-        testedAt: new Date().toISOString()
-      });
-      setLoadingMap((prev) => ({ ...prev, [item.id]: false }));
-      return false;
-    }
-
     try {
-      const response = await postJsonWithTimeout<OpenAIProxyTestResponse>(
-        "/api/openai/test",
-        {
-          baseUrl,
-          apiKey,
-          model: item.model || "gpt-4o-mini"
-        },
-        45000
-      );
-
+      const response: EndpointTestResponse = await runEndpointTest({
+        baseUrl: item.baseUrl,
+        apiKey: item.apiKey,
+        model: item.model || "gpt-4o-mini"
+      });
       commitFinishedTestResult(item.id, response.result);
       return response.ok;
     } catch (error: unknown) {
@@ -2289,39 +2244,24 @@ export default function Home() {
       ...prev,
       [item.id]: {
         status: "pending",
-        supportedModels: item.probe?.supportedModels || []
+        supportedModels: item.probe?.supportedModels || [],
+        imageModels: item.probe?.imageModels || []
       }
     }));
 
-    const baseUrl = toOpenAIBaseUrl(item.baseUrl);
-    const apiKey = cleanKey(item.apiKey);
-
-    if (!baseUrl || !apiKey) {
-      commitFinishedProbeResult(item.id, {
-        status: "error",
-        supportedModels: [],
-        detail: "地址或 Key 为空，无法探测模型",
-        testedAt: new Date().toISOString()
-      });
-      return false;
-    }
-
     try {
-      const response = await postJsonWithTimeout<OpenAIProxyProbeResponse>(
-        "/api/openai/probe",
-        {
-          baseUrl,
-          apiKey,
-          currentModel: item.model
-        },
-        20000
-      );
+      const response: ModelProbeResponse = await probeEndpointModels({
+        baseUrl: item.baseUrl,
+        apiKey: item.apiKey,
+        currentModel: item.model
+      });
       commitFinishedProbeResult(item.id, response.result);
       return response.ok;
     } catch (error: unknown) {
       commitFinishedProbeResult(item.id, {
         status: "error",
         supportedModels: [],
+        imageModels: [],
         detail: makeErrorDetail(error),
         testedAt: new Date().toISOString()
       });
@@ -2360,15 +2300,11 @@ export default function Home() {
     for (let round = 0; round < rounds; round += 1) {
       onRoundStart?.(model, round + 1);
       try {
-        const response = await postJsonWithTimeout<OpenAIProxyBenchmarkRoundResponse>(
-          "/api/openai/benchmark",
-          {
-            baseUrl,
-            apiKey,
-            model
-          },
-          25000
-        );
+        const response: BenchmarkRoundResponse = await runModelBenchmarkRound({
+          baseUrl,
+          apiKey,
+          model
+        });
 
         if (response.ok && response.sample) {
           elapsedSamples.push(response.sample.elapsedMs);
@@ -2379,7 +2315,8 @@ export default function Home() {
             round: round + 1,
             ok: true,
             elapsedMs: response.sample.elapsedMs,
-            firstTokenMs: response.sample.firstTokenMs
+            firstTokenMs: response.sample.firstTokenMs,
+            protocol: response.sample.protocol
           });
           continue;
         }
@@ -2657,6 +2594,55 @@ export default function Home() {
     setProbeDialogId(item.id);
   }
 
+
+  function openImageDialog(item: KeyConfig, preferredModel?: string) {
+    const activeProbe = probeMap[item.id] || item.probe || defaultProbeResult();
+    const detectedModel = activeProbe.imageModels[0] || activeProbe.supportedModels.find(isLikelyImageGenerationModel) || "";
+    const currentImageModel = isLikelyImageGenerationModel(item.model) ? item.model.trim() : "";
+    setImageModelDraft(preferredModel || currentImageModel || detectedModel);
+    setProbeDialogId(null);
+    setBenchmarkDialogId(null);
+    setImageDialogId(item.id);
+  }
+
+  function closeImageDialog() {
+    setImageDialogId(null);
+    setImageModelDraft("");
+  }
+
+  async function testImageModel(item: KeyConfig) {
+    const model = imageModelDraft.trim();
+    if (!model) {
+      setNotice("请选择或填写图像模型");
+      return;
+    }
+
+    setImageLoadingMap((prev) => ({ ...prev, [item.id]: true }));
+    try {
+      const response = await runImageGenerationTest({
+        baseUrl: item.baseUrl,
+        apiKey: item.apiKey,
+        model
+      });
+      setImageTestMap((prev) => ({ ...prev, [item.id]: response.result }));
+      setNotice(response.ok ? `${model} 图像测试通过` : `${model} 图像测试失败`);
+    } catch (error: unknown) {
+      setImageTestMap((prev) => ({
+        ...prev,
+        [item.id]: {
+          status: "error",
+          model,
+          protocol: "images",
+          detail: makeErrorDetail(error),
+          testedAt: new Date().toISOString()
+        }
+      }));
+      setNotice(`${model} 图像测试失败`);
+    } finally {
+      setImageLoadingMap((prev) => ({ ...prev, [item.id]: false }));
+    }
+  }
+
   function openBenchmarkDialog(item: KeyConfig) {
     const activeProbe = probeMap[item.id] || item.probe || defaultProbeResult();
     if (activeProbe.supportedModels.length === 0) {
@@ -2864,7 +2850,7 @@ export default function Home() {
         <div>
           <h1 className="flex items-center gap-2.5 text-2xl font-bold tracking-tight text-zinc-900 sm:text-3xl">
             <Image
-              src="/logo.png"
+              src={`${APP_BASE_PATH}/logo.png`}
               alt="Logo"
               width={32}
               height={32}
@@ -2888,7 +2874,7 @@ export default function Home() {
             </span>
             <div>
               <p className="text-sm font-semibold text-zinc-900">项目源码 GitHub</p>
-              <p className="text-xs text-zinc-500">Yoan98/ai-key-manage</p>
+              <p className="text-xs text-zinc-500">zhjnerv/ai-key-manage</p>
             </div>
           </div>
           <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition group-hover:border-emerald-300 group-hover:bg-emerald-100">
@@ -2909,7 +2895,7 @@ export default function Home() {
           <div>
             <p className="text-base font-extrabold text-emerald-900 sm:text-lg">这是你的 AI API Key 本地保险箱</p>
             <p className="mt-1 text-xs font-medium text-emerald-700/90">
-              {introExpanded ? "点击收起说明" : "包含本地保存、后端代理与使用说明；点击展开"}
+              {introExpanded ? "点击收起说明" : "包含本地保存、多协议直连与使用说明；点击展开"}
             </p>
           </div>
           <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-emerald-200 bg-white/80 text-emerald-700">
@@ -2920,7 +2906,7 @@ export default function Home() {
         {introExpanded ? (
           <>
             <p className="mt-2 text-sm leading-6 text-emerald-800">
-              统一管理名称、地址、Key 和模型，支持粘贴导入、cc-switch SQL 文件导入、一键测试、模型识别、性能评测和唤起 CC Switch；配置数据默认仅保存在当前浏览器本地。
+              统一管理名称、地址、Key 和模型，支持粘贴导入、多协议测试、图像生成测试、模型识别、性能评测和唤起 CC Switch；配置数据默认仅保存在当前浏览器本地。
             </p>
             <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50/80 p-3">
               <div className="flex items-start gap-2.5">
@@ -2930,7 +2916,7 @@ export default function Home() {
                 <div className="space-y-1">
                   <p className="text-sm font-semibold text-amber-900">请求说明</p>
                   <p className="text-sm leading-6 text-amber-900/90">
-                    连通性测试、模型识别、性能评测这类真实联网请求会通过同源后端发起，避免浏览器直连部分上游接口时被 CORS 拦截。
+                    当前 GitHub Pages 版本没有中转后端，所有测试由浏览器直接访问目标 API。Key 不会提交给本站服务器，但目标地址必须允许 CORS；生图测试会产生真实费用。
                   </p>
                 </div>
               </div>
@@ -3070,6 +3056,7 @@ export default function Home() {
                 const isEditing = editingId === item.id;
                 const isEditingModel = editingModelId === item.id;
                 const probing = probe.status === "pending";
+                const imageTesting = imageLoadingMap[item.id];
                 const currentModelTags = inferModelTags(item.model);
                 const runtimeBenchmarks = benchmarkMap[item.id] || {};
                 const currentBenchmark =
@@ -3249,9 +3236,9 @@ export default function Home() {
                                     <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-emerald-700">
                                       AI 返回内容
                                     </div>
-                                    {result.responseSource ? (
-                                      <span className="rounded-full border border-emerald-300 bg-white/70 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                                        来源：{testResponseSourceLabel(result.responseSource)}
+                                    {result.protocol ? (
+                                      <span className="rounded-full border border-emerald-300 bg-white/70 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                                        协议：{testProtocolLabel(result.protocol, result.transport)}
                                       </span>
                                     ) : null}
                                   </div>
@@ -3379,6 +3366,17 @@ export default function Home() {
                             >
                               {probing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
                               <span>识别模型</span>
+                            </button>
+                            <button
+                              type="button"
+                              className={smallBtn}
+                              onClick={() => openImageDialog(item)}
+                              disabled={imageTesting}
+                              title="使用 OpenAI Images 协议生成测试图"
+                              aria-label="图像测试"
+                            >
+                              {imageTesting ? <FaSpinner className="animate-spin" aria-hidden /> : <FaImage aria-hidden />}
+                              <span>图像测试{probe.imageModels.length > 0 ? ` ${probe.imageModels.length}` : ""}</span>
                             </button>
                             <button
                               type="button"
@@ -3522,6 +3520,14 @@ export default function Home() {
                       </button>
                       <button
                         type="button"
+                        className={btnGhost}
+                        onClick={() => openImageDialog(probeDialogItem)}
+                      >
+                        <FaImage aria-hidden />
+                        <span>图像测试{activeProbe.imageModels.length > 0 ? ` ${activeProbe.imageModels.length}` : ""}</span>
+                      </button>
+                      <button
+                        type="button"
                         className={btnPrimary}
                         onClick={() => openBenchmarkDialog(probeDialogItem)}
                         disabled={activeProbe.supportedModels.length === 0}
@@ -3628,6 +3634,17 @@ export default function Home() {
                                 >
                                   <FaCopy aria-hidden />
                                 </button>
+                                {isLikelyImageGenerationModel(model) ? (
+                                  <button
+                                    type="button"
+                                    className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-rose-50 text-rose-600 transition hover:border-rose-300 hover:bg-rose-100"
+                                    onClick={() => openImageDialog(probeDialogItem, model)}
+                                    title={`使用 ${model} 生图测试`}
+                                    aria-label={`使用 ${model} 生图测试`}
+                                  >
+                                    <FaImage aria-hidden />
+                                  </button>
+                                ) : null}
                                 <button
                                   type="button"
                                   className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-[11px] transition disabled:cursor-not-allowed disabled:opacity-45 ${
@@ -3654,6 +3671,83 @@ export default function Home() {
                 </>
               );
             })()}
+          </div>
+        </div>
+      ) : null}
+
+
+      {imageDialogItem ? (
+        <div className="fixed inset-0 z-40 flex items-center justify-center overflow-y-auto bg-zinc-950/45 px-3 py-5 sm:px-4">
+          <div className="w-full max-w-3xl rounded-[28px] border border-zinc-200 bg-white p-4 shadow-2xl sm:p-6">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="inline-flex items-center gap-2 text-lg font-semibold text-zinc-900">
+                  <FaImage className="text-rose-500" aria-hidden />
+                  <span>图像模型测试</span>
+                </p>
+                <p className="mt-1 text-sm text-zinc-500">
+                  {imageDialogItem.name} · 调用 OpenAI Images 协议 /images/generations
+                </p>
+              </div>
+              <button type="button" className={smallBtn} onClick={closeImageDialog}>
+                <FaTimesCircle aria-hidden />
+                <span>关闭</span>
+              </button>
+            </div>
+
+            <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-900">
+              生图测试会真实调用模型并产生费用。GitHub Pages 版本由浏览器直连，若目标服务未允许 CORS，会返回明确的跨域提示。
+            </div>
+
+            <label className="mt-4 block">
+              <span className="mb-1.5 block text-sm font-semibold text-zinc-700">图像模型</span>
+              <input
+                className={inputClass}
+                list={`image-models-${imageDialogItem.id}`}
+                value={imageModelDraft}
+                onChange={(event) => setImageModelDraft(event.target.value)}
+                placeholder="例如 gpt-image-2.5-sunburst、gpt-image-1、dall-e-3"
+              />
+              <datalist id={`image-models-${imageDialogItem.id}`}>
+                {(probeMap[imageDialogItem.id] || imageDialogItem.probe || defaultProbeResult()).imageModels.map((model) => (
+                  <option key={model} value={model} />
+                ))}
+              </datalist>
+            </label>
+
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className={btnPrimary}
+                onClick={() => testImageModel(imageDialogItem)}
+                disabled={Boolean(imageLoadingMap[imageDialogItem.id]) || !imageModelDraft.trim()}
+              >
+                {imageLoadingMap[imageDialogItem.id] ? <FaSpinner className="animate-spin" aria-hidden /> : <FaImage aria-hidden />}
+                <span>{imageLoadingMap[imageDialogItem.id] ? "生成中..." : "生成测试图"}</span>
+              </button>
+              <span className="text-xs text-zinc-500">提示词固定为白底绿色圆形，用最小语义验证生图能力。</span>
+            </div>
+
+            {activeImageTest ? (
+              <div className={`mt-5 rounded-2xl border p-4 ${activeImageTest.status === "success" ? "border-emerald-200 bg-emerald-50/70" : "border-red-200 bg-red-50/70"}`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <StatusIcon status={activeImageTest.status} />
+                  <span className="font-semibold text-zinc-900">{activeImageTest.model}</span>
+                  <span className="rounded-full border border-zinc-300 bg-white px-2 py-0.5 text-[10px] font-semibold text-zinc-700">
+                    协议：images
+                  </span>
+                </div>
+                {activeImageTest.detail ? <p className="mt-2 text-sm leading-6 text-zinc-700">{activeImageTest.detail}</p> : null}
+                {activeImageTest.revisedPrompt ? (
+                  <p className="mt-2 text-xs leading-5 text-zinc-500">修订提示词：{activeImageTest.revisedPrompt}</p>
+                ) : null}
+                {activeImageTest.imageUrl ? (
+                  <div className="relative mt-4 aspect-square w-full max-w-md overflow-hidden rounded-2xl border border-zinc-200 bg-white">
+                    <Image src={activeImageTest.imageUrl} alt={`${activeImageTest.model} 生成的端点测试图`} fill unoptimized className="object-contain" />
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}
@@ -4175,6 +4269,7 @@ export default function Home() {
                                       <th className="px-4 py-3">状态</th>
                                       <th className="px-4 py-3">总耗时</th>
                                       <th className="px-4 py-3">首字时间</th>
+                                      <th className="px-4 py-3">协议</th>
                                       <th className="px-4 py-3">错误信息</th>
                                     </tr>
                                   </thead>
@@ -4194,6 +4289,7 @@ export default function Home() {
                                         </td>
                                         <td className="px-4 py-3 text-zinc-700">{detail.ok ? formatDurationLabel(detail.elapsedMs) : "-"}</td>
                                         <td className="px-4 py-3 text-zinc-700">{detail.ok ? formatDurationLabel(detail.firstTokenMs) : "-"}</td>
+                                        <td className="px-4 py-3 text-xs font-semibold text-zinc-600">{detail.protocol || "-"}</td>
                                         <td className="px-4 py-3 text-xs leading-5 text-zinc-500">{detail.error || "-"}</td>
                                       </tr>
                                     ))}
