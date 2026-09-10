@@ -216,7 +216,7 @@ const smallDangerBtn =
   "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:border-red-700 hover:bg-red-700 hover:text-white";
 const iconCopyBtn =
   "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45";
-const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses、/messages；测试会自动探测 chat、response、message 协议。GitHub Pages 版本由浏览器直连，目标地址必须允许 CORS。";
+const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses、/messages；测试会自动探测 chat、response、message 协议。当前静态版本由浏览器直连，目标地址必须允许 CORS。";
 const ReactECharts = dynamic(() => import("echarts-for-react"), { ssr: false });
 
 function normalizeBaseUrl(raw: string): string {
@@ -2916,7 +2916,7 @@ export default function Home() {
                 <div className="space-y-1">
                   <p className="text-sm font-semibold text-amber-900">请求说明</p>
                   <p className="text-sm leading-6 text-amber-900/90">
-                    当前 GitHub Pages 版本没有中转后端，所有测试由浏览器直接访问目标 API。Key 不会提交给本站服务器，但目标地址必须允许 CORS；生图测试会产生真实费用。
+                    当前版本暂未配置中转后端，所有测试由浏览器直接访问目标 API。Key 不会提交给本站服务器，但目标地址必须允许 CORS；生图测试会产生真实费用。
                   </p>
                 </div>
               </div>
@@ -3696,7 +3696,7 @@ export default function Home() {
             </div>
 
             <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-900">
-              生图测试会真实调用模型并产生费用。GitHub Pages 版本由浏览器直连，若目标服务未允许 CORS，会返回明确的跨域提示。
+              生图测试会真实调用模型并产生费用。当前静态版本由浏览器直连，若目标服务未允许 CORS，会返回明确的跨域提示。
             </div>
 
             <label className="mt-4 block">

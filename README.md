@@ -97,11 +97,9 @@ npm run start
 
 `npm run build` 会生成纯静态 `out/` 目录，`npm run start` 使用项目内置的零依赖静态服务器预览。
 
-## GitHub Pages 部署
+## 部署状态
 
-仓库内置 `.github/workflows/deploy-pages.yml`。推送到 `main` 后，GitHub Actions 会依次执行测试、ESLint、静态构建并部署到 GitHub Pages。
-
-首次部署需要在仓库 **Settings → Pages → Build and deployment** 中选择 **GitHub Actions**。
+GitHub Pages 已停用，仓库不再包含 Pages 自动部署工作流。当前代码仍可生成纯静态 `out/` 目录，下一阶段接入 Cloudflare Worker 同源代理后再恢复线上部署。
 
 ## Docker 一键部署
 
