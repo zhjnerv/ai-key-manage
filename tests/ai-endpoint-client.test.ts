@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  getRateLimitDelayMs,
   isLikelyImageGenerationModel,
   runEndpointTest,
   runImageGenerationTest,
@@ -9,10 +10,10 @@ import {
   toAiApiBaseUrl,
 } from "../lib/ai-endpoint-client.ts";
 
-function jsonResponse(payload: unknown, status = 200): Response {
+function jsonResponse(payload: unknown, status = 200, headers?: HeadersInit): Response {
   return new Response(JSON.stringify(payload), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
 }
 
@@ -102,4 +103,52 @@ test("Images 协议返回可预览图片", async (t) => {
   assert.equal(response.ok, true);
   assert.equal(response.result.protocol, "images");
   assert.equal(response.result.imageUrl, "data:image/png;base64,aGVsbG8=");
+});
+
+test("限流等待优先采用响应头并封顶 65 秒", () => {
+  assert.equal(
+    getRateLimitDelayMs(new Response("", { status: 429, headers: { "Retry-After": "12" } }), null, 0, 0),
+    12000,
+  );
+  assert.equal(
+    getRateLimitDelayMs(new Response("", { status: 429, headers: { "Retry-After": "120" } }), null, 0, 0),
+    65000,
+  );
+  assert.equal(
+    getRateLimitDelayMs(new Response("", { status: 400 }), { error: { message: "TPM limit exceeded per minute" } }, 0, 0),
+    65000,
+  );
+  assert.deepEqual(
+    [0, 1, 2, 3].map((index) => getRateLimitDelayMs(new Response("", { status: 429 }), null, index, 0)),
+    [5000, 15000, 30000, 65000],
+  );
+});
+
+test("模型列表触发限流后自动等待并重试当前请求", async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls += 1;
+    if (calls === 1) {
+      return jsonResponse({ error: { message: "rate limit" } }, 429, { "retry-after-ms": "1" });
+    }
+    return jsonResponse({ data: [{ id: "gpt-5" }] });
+  });
+
+  const response = await runModelProbe({ baseUrl: "https://api.example.test", apiKey: "sk-test", currentModel: "gpt-5" });
+  assert.equal(response.ok, true);
+  assert.equal(calls, 2);
+});
+
+test("模型接口两种鉴权均被拒绝时不再轰炸候选模型", async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls += 1;
+    return jsonResponse({ error: { message: `Invalid token (request id: request-${calls})` } }, 401);
+  });
+
+  const response = await runModelProbe({ baseUrl: "https://api.example.test", apiKey: "wrong-token" });
+  assert.equal(response.ok, false);
+  assert.equal(calls, 2);
+  assert.match(response.result.detail || "", /Invalid token/);
+  assert.doesNotMatch(response.result.detail || "", /gpt-5/);
 });

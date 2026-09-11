@@ -3,14 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "node node_modules/next/dist/bin/next dev",
+    "build": "node node_modules/next/dist/bin/next build",
     "start": "node scripts/serve-static.mjs",
     "docker:build": "docker compose build",
     "docker:deploy": "docker compose up -d --build",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f app",
-    "lint": "eslint",
+    "lint": "node node_modules/eslint/bin/eslint.js .",
     "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/*.test.ts"
   },
   "dependencies": {

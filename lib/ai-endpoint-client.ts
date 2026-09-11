@@ -176,13 +176,125 @@ export function makeErrorDetail(error: unknown): string {
   return `${detail}；接口返回：${raw}`;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+const RATE_LIMIT_BACKOFF_MS = [5000, 15000, 30000, 65000] as const;
+const MAX_RATE_LIMIT_RETRIES = RATE_LIMIT_BACKOFF_MS.length;
+const RATE_LIMIT_TEXT_RE = /rate[\s_-]*limit|too many requests|\btpm\b|\brpm\b|tokens? per minute|requests? per minute|每分钟|限流|请求过于频繁|频率限制/i;
+const MINUTE_LIMIT_TEXT_RE = /\btpm\b|\brpm\b|tokens? per minute|requests? per minute|per minute|每分钟|分钟额度/i;
+
+function parseDurationMs(value: string, nowMs: number): number | undefined {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+
+  const numeric = Number(normalized);
+  if (Number.isFinite(numeric)) {
+    if (numeric > 1_000_000_000_000) return Math.max(0, numeric - nowMs);
+    if (numeric > 1_000_000_000) return Math.max(0, numeric * 1000 - nowMs);
+    return Math.max(0, numeric * 1000);
+  }
+
+  const dateMs = Date.parse(value);
+  if (Number.isFinite(dateMs)) return Math.max(0, dateMs - nowMs);
+
+  let totalMs = 0;
+  let matched = false;
+  for (const match of normalized.matchAll(/(\d+(?:\.\d+)?)\s*(ms|s|m|h)/g)) {
+    matched = true;
+    const amount = Number(match[1]);
+    const unit = match[2];
+    totalMs += amount * (unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60000 : 3600000);
+  }
+  return matched ? totalMs : undefined;
+}
+
+function getHeaderRetryDelayMs(response: Response, nowMs: number): number | undefined {
+  const retryAfterMs = response.headers.get("retry-after-ms");
+  if (retryAfterMs) {
+    const parsed = Number(retryAfterMs);
+    if (Number.isFinite(parsed)) return Math.max(0, parsed);
+  }
+
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter) {
+    const parsed = parseDurationMs(retryAfter, nowMs);
+    if (parsed !== undefined) return parsed;
+  }
+
+  const resetHeaders = [
+    "x-ratelimit-reset",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+  ];
+  const delays = resetHeaders
+    .map((name) => response.headers.get(name))
+    .filter((value): value is string => Boolean(value))
+    .map((value) => parseDurationMs(value, nowMs))
+    .filter((value): value is number => value !== undefined);
+  return delays.length > 0 ? Math.max(...delays) : undefined;
+}
+
+export function getRateLimitDelayMs(
+  response: Response,
+  payload: unknown,
+  retryIndex: number,
+  nowMs = Date.now(),
+): number | undefined {
+  const message = getErrorMessage(payload);
+  if (response.status !== 429 && !RATE_LIMIT_TEXT_RE.test(message)) return undefined;
+
+  const headerDelay = getHeaderRetryDelayMs(response, nowMs);
+  if (headerDelay !== undefined) return Math.min(65000, Math.max(1000, Math.round(headerDelay)));
+  if (MINUTE_LIMIT_TEXT_RE.test(message)) return 65000;
+  return RATE_LIMIT_BACKOFF_MS[Math.min(retryIndex, RATE_LIMIT_BACKOFF_MS.length - 1)];
+}
+
+function isRateLimitErrorText(value: string): boolean {
+  return RATE_LIMIT_TEXT_RE.test(value);
+}
+
+function isAuthenticationErrorText(value: string): boolean {
+  return /invalid token|invalid api key|incorrect api key|unauthorized|authentication|鉴权失败|令牌无效|密钥无效/i.test(value);
+}
+
+function compactErrors(values: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const value of values.map((item) => item.trim()).filter(Boolean)) {
+    const key = value.replace(/\s*\(request id:[^)]+\)/gi, "").replace(/request[_ -]?id[：:]?\s*[A-Za-z0-9_-]+/gi, "").trim();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(value);
+  }
+  return output;
+}
+
+async function waitForRateLimit(delayMs: number, url: string, retryNumber: number): Promise<void> {
+  let upstreamHost = "unknown";
+  try {
+    upstreamHost = new URL(url).host;
+  } catch {
+    // URL 已在上游调用前校验；这里只保留安全的诊断信息。
+  }
+  console.log(JSON.stringify({ event: "rate_limit_wait", upstreamHost, retryNumber, delayMs }));
+  await new Promise<void>((resolve) => globalThis.setTimeout(resolve, delayMs));
+}
+
+async function fetchOnceWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: controller.signal, cache: "no-store" });
   } finally {
     globalThis.clearTimeout(timer);
+  }
+}
+
+async function fetchResponseWithRateLimitRetry(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  for (let retryIndex = 0; ; retryIndex += 1) {
+    const response = await fetchOnceWithTimeout(url, init, timeoutMs);
+    const payload = response.ok ? null : await readPayload(response.clone());
+    const delayMs = getRateLimitDelayMs(response, payload, retryIndex);
+    if (delayMs === undefined || retryIndex >= MAX_RATE_LIMIT_RETRIES) return response;
+    await waitForRateLimit(delayMs, url, retryIndex + 1);
   }
 }
 
@@ -210,8 +322,13 @@ async function readPayload(response: Response): Promise<unknown> {
 }
 
 async function fetchJson(url: string, init: RequestInit, timeoutMs: number): Promise<JsonRequestResult> {
-  const response = await fetchWithTimeout(url, init, timeoutMs);
-  return { response, payload: await readPayload(response) };
+  for (let retryIndex = 0; ; retryIndex += 1) {
+    const response = await fetchOnceWithTimeout(url, init, timeoutMs);
+    const payload = await readPayload(response);
+    const delayMs = getRateLimitDelayMs(response, payload, retryIndex);
+    if (delayMs === undefined || retryIndex >= MAX_RATE_LIMIT_RETRIES) return { response, payload };
+    await waitForRateLimit(delayMs, url, retryIndex + 1);
+  }
 }
 
 function requestError(response: Response, payload: unknown): string {
@@ -353,7 +470,7 @@ function parseSseBlock(block: string): string {
 async function requestChatStream(baseUrl: string, apiKey: string, model: string, prompt: string, maxTokens: number): Promise<TextAttempt> {
   const startedAt = performance.now();
   try {
-    const response = await fetchWithTimeout(
+    const response = await fetchResponseWithRateLimitRetry(
       `${baseUrl}/chat/completions`,
       {
         method: "POST",
@@ -473,6 +590,7 @@ async function executeTextAttempts(baseUrl: string, apiKey: string, model: strin
     const result = await request(baseUrl, apiKey, model, prompt, maxTokens);
     attempts.push(result);
     if (result.ok && !isLowSignalText(result.text)) break;
+    if (result.error && isRateLimitErrorText(result.error)) break;
   }
   return attempts;
 }
@@ -483,7 +601,7 @@ function protocolLabel(protocol: TextProtocol, transport: ResponseTransport): st
 }
 
 function formatAttemptErrors(attempts: TextAttempt[]): string {
-  return uniqueStrings(
+  return compactErrors(
     attempts
       .filter((attempt) => !attempt.ok && attempt.error)
       .map((attempt) => `${protocolLabel(attempt.protocol, attempt.transport)}：${attempt.error}`),
@@ -548,22 +666,78 @@ function chooseRecommendedModel(currentModel: string, models: string[]): string 
   return models.find((model) => !isLikelyImageGenerationModel(model)) || "";
 }
 
-async function requestModels(baseUrl: string, apiKey: string, anthropicAuth: boolean): Promise<{ models: string[]; error?: string }> {
+type ModelRequestResult = {
+  models: string[];
+  error?: string;
+  authenticationRejected?: boolean;
+  rateLimited?: boolean;
+};
+
+type ModelAuthentication = "bearer" | "anthropic" | "none";
+
+async function requestModels(baseUrl: string, apiKey: string, authentication: ModelAuthentication): Promise<ModelRequestResult> {
   try {
-    const headers: Record<string, string> = anthropicAuth
-      ? {
-          "x-api-key": apiKey,
-          "anthropic-version": ANTHROPIC_VERSION,
-          "anthropic-dangerous-direct-browser-access": "true",
-        }
-      : { Authorization: `Bearer ${apiKey}` };
+    const headers: Record<string, string> = authentication === "none"
+      ? {}
+      : authentication === "anthropic"
+        ? {
+            "x-api-key": apiKey,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "anthropic-dangerous-direct-browser-access": "true",
+          }
+        : { Authorization: `Bearer ${apiKey}` };
     const { response, payload } = await fetchJson(`${baseUrl}/models`, { headers }, 10000);
-    if (!response.ok) return { models: [], error: requestError(response, payload) };
+    if (!response.ok) {
+      const error = requestError(response, payload);
+      return {
+        models: [],
+        error,
+        authenticationRejected: response.status === 401 || response.status === 403 || isAuthenticationErrorText(error),
+        rateLimited: response.status === 429 || isRateLimitErrorText(error),
+      };
+    }
     const models = extractModels(payload);
     return models.length > 0 ? { models } : { models: [], error: "/models 可达，但未返回可识别模型" };
   } catch (error) {
-    return { models: [], error: makeErrorDetail(error) };
+    const detail = makeErrorDetail(error);
+    return { models: [], error: detail, rateLimited: isRateLimitErrorText(detail) };
   }
+}
+
+export async function runPublicModelProbe(input: ModelProbeRequest): Promise<ModelProbeResponse> {
+  const baseUrl = toAiApiBaseUrl(input.baseUrl);
+  const currentModel = input.currentModel?.trim() || "";
+  const testedAt = new Date().toISOString();
+  if (!baseUrl) {
+    return { ok: false, result: { status: "error", supportedModels: [], imageModels: [], detail: "地址为空，无法探测模型", testedAt } };
+  }
+
+  const attempt = await requestModels(baseUrl, "", "none");
+  if (attempt.models.length === 0) {
+    return {
+      ok: false,
+      result: {
+        status: "error",
+        supportedModels: [],
+        imageModels: [],
+        detail: `HTTP 模型探测未携带 Key：${attempt.error || "未返回可识别模型"}`,
+        testedAt,
+      },
+    };
+  }
+
+  const imageModels = attempt.models.filter(isLikelyImageGenerationModel);
+  return {
+    ok: true,
+    result: {
+      status: "success",
+      supportedModels: attempt.models,
+      imageModels,
+      recommendedModel: chooseRecommendedModel(currentModel, attempt.models) || undefined,
+      detail: `通过公开 HTTP /models 识别 ${attempt.models.length} 个模型；未向上游发送 Key`,
+      testedAt,
+    },
+  };
 }
 
 export async function runModelProbe(input: ModelProbeRequest): Promise<ModelProbeResponse> {
@@ -576,10 +750,10 @@ export async function runModelProbe(input: ModelProbeRequest): Promise<ModelProb
     return { ok: false, result: { status: "error", supportedModels: [], imageModels: [], detail: "地址或 Key 为空，无法探测模型", testedAt } };
   }
 
-  const bearerModels = await requestModels(baseUrl, apiKey, false);
+  const bearerModels = await requestModels(baseUrl, apiKey, "bearer");
   const modelAttempts = [bearerModels];
-  if (bearerModels.models.length === 0) {
-    modelAttempts.push(await requestModels(baseUrl, apiKey, true));
+  if (bearerModels.models.length === 0 && !bearerModels.rateLimited) {
+    modelAttempts.push(await requestModels(baseUrl, apiKey, "anthropic"));
   }
   const models = uniqueStrings(modelAttempts.flatMap((attempt) => attempt.models));
   if (models.length > 0) {
@@ -592,6 +766,22 @@ export async function runModelProbe(input: ModelProbeRequest): Promise<ModelProb
         imageModels,
         recommendedModel: chooseRecommendedModel(currentModel, models) || undefined,
         detail: `读取 /models 成功，共识别 ${models.length} 个模型，其中图像模型 ${imageModels.length} 个`,
+        testedAt,
+      },
+    };
+  }
+
+  const modelErrors = compactErrors(modelAttempts.map((attempt) => attempt.error || ""));
+  const allAuthenticationRejected = modelAttempts.length > 0 && modelAttempts.every((attempt) => attempt.authenticationRejected);
+  const anyRateLimited = modelAttempts.some((attempt) => attempt.rateLimited);
+  if (allAuthenticationRejected || anyRateLimited) {
+    return {
+      ok: false,
+      result: {
+        status: "error",
+        supportedModels: [],
+        imageModels: [],
+        detail: modelErrors.join("；") || (anyRateLimited ? "模型接口触发限流，自动重试后仍不可用" : "模型接口鉴权失败"),
         testedAt,
       },
     };
@@ -621,14 +811,13 @@ export async function runModelProbe(input: ModelProbeRequest): Promise<ModelProb
     };
   }
 
-  const modelErrors = modelAttempts.map((attempt) => attempt.error || "");
   return {
     ok: false,
     result: {
       status: "error",
       supportedModels: [],
       imageModels: [],
-      detail: uniqueStrings([...modelErrors, ...fallbackErrors]).join("；") || "未探测到可用模型",
+      detail: compactErrors([...modelErrors, ...fallbackErrors]).join("；") || "未探测到可用模型",
       testedAt,
     },
   };

@@ -29,6 +29,7 @@ import {
   FaVial
 } from "react-icons/fa";
 import { parseCcSwitchSqlProviders } from "@/lib/cc-switch-sql";
+import { deriveConfigNameFromBaseUrl } from "@/lib/config-name";
 import {
   isLikelyImageGenerationModel,
   makeErrorDetail,
@@ -36,7 +37,7 @@ import {
   runImageGenerationTest,
   runModelBenchmarkRound,
   runModelProbe as probeEndpointModels
-} from "@/lib/ai-endpoint-client";
+} from "@/lib/ai-endpoint-browser-client";
 import type {
   BenchmarkRoundResponse,
   EndpointTestResponse,
@@ -216,7 +217,9 @@ const smallDangerBtn =
   "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:border-red-700 hover:bg-red-700 hover:text-white";
 const iconCopyBtn =
   "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45";
-const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses、/messages；测试会自动探测 chat、response、message 协议。当前静态版本由浏览器直连，目标地址必须允许 CORS。";
+const endpointHintText = process.env.NEXT_PUBLIC_USE_SERVER_PROXY === "1"
+  ? "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses、/messages；测试请求由同源服务端代理转发，不受浏览器 CORS 限制；遇到 429、TPM 或 RPM 限制时会自动等待重试。"
+  : "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses、/messages；测试会自动探测 chat、response、message 协议。当前静态版本由浏览器直连，目标地址必须允许 CORS。";
 const ReactECharts = dynamic(() => import("echarts-for-react"), { ssr: false });
 
 function normalizeBaseUrl(raw: string): string {
@@ -581,7 +584,7 @@ function finalizeParsed(items: Partial<ParsedConfig>[], startIndex: number): Par
 
   return deduped.map((item, index) => ({
     ...item,
-    name: item.name || makeDefaultName(startIndex + index)
+    name: item.name || deriveConfigNameFromBaseUrl(item.baseUrl) || makeDefaultName(startIndex + index)
   }));
 }
 
@@ -897,22 +900,32 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
     input.responseSource === "stream" || input.responseSource === "chat" || input.responseSource === "responses"
       ? input.responseSource
       : undefined;
+  const detailProtocolMatch = rawDetail.match(/协议[：:]\s*(chat(?:（流式）|\s*[·-]\s*stream)?|response|message)/i);
+  const detailProtocolText = detailProtocolMatch?.[1]?.toLowerCase() || "";
   const protocol =
     input.protocol === "chat" || input.protocol === "response" || input.protocol === "message"
       ? input.protocol
-      : legacySource === "responses"
-        ? "response"
-        : legacySource
-          ? "chat"
-          : undefined;
+      : detailProtocolText.startsWith("chat")
+        ? "chat"
+        : detailProtocolText === "response" || detailProtocolText === "message"
+          ? detailProtocolText
+          : legacySource === "responses"
+            ? "response"
+            : legacySource
+              ? "chat"
+              : undefined;
   const transport =
     input.transport === "stream" || input.transport === "json"
       ? input.transport
-      : legacySource === "stream"
+      : detailProtocolText.includes("流式") || detailProtocolText.includes("stream")
         ? "stream"
-        : legacySource
+        : protocol
           ? "json"
-          : undefined;
+          : legacySource === "stream"
+            ? "stream"
+            : legacySource
+              ? "json"
+              : undefined;
   const detail = rawDetail && !legacyResponseText ? cleanOneLineText(rawDetail, 300) : responseText ? "接口连通，已收到模型回复" : "";
   const testedAt = safeDateToIso(input.testedAt);
 
@@ -1325,7 +1338,7 @@ function normalizeStoredConfigItem(input: unknown, index: number): KeyConfig | u
 
   if (!hasCoreValue) return undefined;
 
-  const name = rawName || makeDefaultName(index + 1);
+  const name = rawName || deriveConfigNameFromBaseUrl(baseUrl) || makeDefaultName(index + 1);
   return { id, name, baseUrl, apiKey, model, createdAt, sourceMeta, probe, lastTest, benchmarks };
 }
 
@@ -1380,7 +1393,7 @@ function defaultTestResult(): TestResult {
 }
 
 function testProtocolLabel(protocol?: TextProtocol, transport?: ResponseTransport): string {
-  if (protocol === "chat") return transport === "stream" ? "chat · stream" : "chat";
+  if (protocol === "chat") return transport === "stream" ? "chat（流式）" : "chat";
   if (protocol === "response") return "response";
   if (protocol === "message") return "message";
   return "";
@@ -2046,7 +2059,7 @@ export default function Home() {
       setNotice("请至少填写地址、Key、模型中的一个");
       return;
     }
-    if (!name) name = makeDefaultName(nextIndex);
+    if (!name) name = deriveConfigNameFromBaseUrl(baseUrl) || makeDefaultName(nextIndex);
 
     addItem(name, baseUrl, apiKey, model, formSourceMeta);
     setNotice("保存成功");
@@ -2179,7 +2192,7 @@ export default function Home() {
           status: "pending",
           model,
           tags,
-          detail: "测试中..."
+          detail: "测试中（限流时自动等待，最长 65 秒）..."
         }
       }
     }));
@@ -2201,7 +2214,7 @@ export default function Home() {
               status: "pending" as const,
               model,
               tags: inferModelTags(model),
-              detail: "测试中..."
+              detail: "测试中（限流时自动等待，最长 65 秒）..."
             }
           ])
         )
@@ -2209,9 +2222,9 @@ export default function Home() {
     }));
   }
 
-  async function runTest(item: KeyConfig): Promise<boolean> {
+  async function runTest(item: KeyConfig): Promise<EndpointTestResponse> {
     setLoadingMap((prev) => ({ ...prev, [item.id]: true }));
-    setResultMap((prev) => ({ ...prev, [item.id]: { status: "pending", message: "测试中..." } }));
+    setResultMap((prev) => ({ ...prev, [item.id]: { status: "pending", message: "测试中（限流时自动等待，最长 65 秒）..." } }));
 
     try {
       const response: EndpointTestResponse = await runEndpointTest({
@@ -2220,23 +2233,27 @@ export default function Home() {
         model: item.model || "gpt-4o-mini"
       });
       commitFinishedTestResult(item.id, response.result);
-      return response.ok;
+      return response;
     } catch (error: unknown) {
-      commitFinishedTestResult(item.id, {
+      const result: FinishedTestResult = {
         status: "error",
         message: FAIL_TEXT,
         detail: makeErrorDetail(error),
         testedAt: new Date().toISOString()
-      });
-      return false;
+      };
+      commitFinishedTestResult(item.id, result);
+      return { ok: false, result };
     } finally {
       setLoadingMap((prev) => ({ ...prev, [item.id]: false }));
     }
   }
 
   async function testConfig(item: KeyConfig) {
-    const ok = await runTest(item);
-    setNotice(ok ? `${item.name} 测试通过` : `${item.name} 测试失败`);
+    const response = await runTest(item);
+    const protocol = response.result.protocol
+      ? testProtocolLabel(response.result.protocol, response.result.transport)
+      : "";
+    setNotice(response.ok ? `${item.name} 测试通过${protocol ? ` · 命中 ${protocol}` : ""}` : `${item.name} 测试失败`);
   }
 
   async function runModelProbe(item: KeyConfig): Promise<boolean> {
@@ -2245,7 +2262,8 @@ export default function Home() {
       [item.id]: {
         status: "pending",
         supportedModels: item.probe?.supportedModels || [],
-        imageModels: item.probe?.imageModels || []
+        imageModels: item.probe?.imageModels || [],
+        detail: "识别中（限流时自动等待，最长 65 秒）..."
       }
     }));
 
@@ -2516,7 +2534,7 @@ export default function Home() {
     setTestingAll(true);
     setNotice("开始测试全部配置...");
     const result = await Promise.all(configs.map((item) => runTest(item)));
-    const passCount = result.filter(Boolean).length;
+    const passCount = result.filter((item) => item.ok).length;
     const failCount = result.length - passCount;
     setTestingAll(false);
     setNotice(`测试完成：通过 ${passCount}，失败 ${failCount}`);
@@ -2772,7 +2790,7 @@ export default function Home() {
         item.id === id
           ? {
               ...item,
-              name: name || item.name,
+              name: name || deriveConfigNameFromBaseUrl(baseUrl) || item.name,
               baseUrl,
               apiKey,
               model,
@@ -2895,7 +2913,7 @@ export default function Home() {
           <div>
             <p className="text-base font-extrabold text-emerald-900 sm:text-lg">这是你的 AI API Key 本地保险箱</p>
             <p className="mt-1 text-xs font-medium text-emerald-700/90">
-              {introExpanded ? "点击收起说明" : "包含本地保存、多协议直连与使用说明；点击展开"}
+              {introExpanded ? "点击收起说明" : "查看功能摘要；点击展开"}
             </p>
           </div>
           <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-emerald-200 bg-white/80 text-emerald-700">
@@ -2908,19 +2926,6 @@ export default function Home() {
             <p className="mt-2 text-sm leading-6 text-emerald-800">
               统一管理名称、地址、Key 和模型，支持粘贴导入、多协议测试、图像生成测试、模型识别、性能评测和唤起 CC Switch；配置数据默认仅保存在当前浏览器本地。
             </p>
-            <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50/80 p-3">
-              <div className="flex items-start gap-2.5">
-                <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-amber-200 bg-white text-amber-700">
-                  <FaInfoCircle aria-hidden />
-                </span>
-                <div className="space-y-1">
-                  <p className="text-sm font-semibold text-amber-900">请求说明</p>
-                  <p className="text-sm leading-6 text-amber-900/90">
-                    当前版本暂未配置中转后端，所有测试由浏览器直接访问目标 API。Key 不会提交给本站服务器，但目标地址必须允许 CORS；生图测试会产生真实费用。
-                  </p>
-                </div>
-              </div>
-            </div>
             <p className="mt-2 text-xs font-medium text-emerald-700/90">单条配置支持直接导出到 CC Switch。</p>
           </>
         ) : null}
@@ -2970,7 +2975,7 @@ export default function Home() {
               className={inputClass}
               value={form.name}
               onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
-              placeholder={`例如：${makeDefaultName(nextIndex)}`}
+              placeholder="留空自动从地址提取，例如 furry"
             />
 
             <label className={labelClass}>地址</label>
@@ -3222,6 +3227,14 @@ export default function Home() {
                                 <StatusIcon status={result.status} />
                                 <span>{result.message}</span>
                               </span>
+                              {result.status === "success" ? (
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-xs font-medium text-zinc-500">命中协议</span>
+                                  <span className="rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-xs font-bold text-emerald-800">
+                                    {result.protocol ? testProtocolLabel(result.protocol, result.transport) : "未识别"}
+                                  </span>
+                                </div>
+                              ) : null}
                               {result.status === "error" && result.detail ? (
                                 <details className="w-full rounded-lg border border-red-100 bg-red-50/50 px-2 py-1.5 text-xs text-red-800">
                                   <summary className="cursor-pointer font-medium text-red-700">有错误，点击查看详情</summary>
@@ -3236,11 +3249,6 @@ export default function Home() {
                                     <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-emerald-700">
                                       AI 返回内容
                                     </div>
-                                    {result.protocol ? (
-                                      <span className="rounded-full border border-emerald-300 bg-white/70 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
-                                        协议：{testProtocolLabel(result.protocol, result.transport)}
-                                      </span>
-                                    ) : null}
                                   </div>
                                   <div className="whitespace-pre-wrap break-words text-xs leading-5 text-emerald-950">
                                     {result.responseText}
